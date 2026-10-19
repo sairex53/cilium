@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/cilium/fake"
 	"github.com/cilium/hive/hivetest"
@@ -352,6 +353,50 @@ func TestPrivilegedCtGcTcp(t *testing.T) {
 	err = natMap.Map.Dump(buf)
 	require.NoError(t, err)
 	require.Empty(t, buf)
+}
+
+// TestPrivilegedCtGcReopenedEntry verifies that CT GC re-checks an entry before
+// deleting it, so a datapath refresh after the batch snapshot preserves the flow.
+func TestPrivilegedCtGcReopenedEntry(t *testing.T) {
+	setupCTMap(t)
+
+	ctMap := newMap(MapNameTCP4Global+"_reopened_test", mapTypeIPv4TCPGlobal, nil)
+	err := ctMap.OpenOrCreate()
+	require.NoError(t, err)
+	defer ctMap.Map.Unpin()
+
+	key := &CtKey4Global{
+		tuple.TupleKey4Global{
+			TupleKey4: tuple.TupleKey4{
+				SourceAddr: types.IPv4{192, 168, 61, 12},
+				DestAddr:   types.IPv4{192, 168, 61, 11},
+				SourcePort: 0x3195,
+				DestPort:   0x50,
+				NextHeader: u8proto.TCP,
+				Flags:      tuple.TUPLE_F_OUT,
+			},
+		},
+	}
+	filter := GCFilter{RemoveExpired: true, Time: 40000}
+
+	// The batch snapshot was expired, but the datapath refreshed the live entry.
+	err = ctMap.Map.Update(key, &CtEntry{Packets: 5, Bytes: 600, Lifetime: 50000})
+	require.NoError(t, err)
+
+	err = ctMap.purgeCtEntry(key, key, &CtEntry{}, filter, nil, func(GCEvent) {}, nil)
+	require.ErrorIs(t, err, errDeferredReopened)
+
+	_, err = ctMap.Map.Lookup(key)
+	require.NoError(t, err, "a reopened entry must not be deleted")
+
+	// An entry that is still expired must remain eligible for deletion.
+	err = ctMap.Map.Update(key, &CtEntry{Packets: 1, Bytes: 216, Lifetime: 38000})
+	require.NoError(t, err)
+	err = ctMap.purgeCtEntry(key, key, &CtEntry{}, filter, nil, func(GCEvent) {}, nil)
+	require.NoError(t, err)
+
+	_, err = ctMap.Map.Lookup(key)
+	require.ErrorIs(t, err, ebpf.ErrKeyNotExist)
 }
 
 // TestPrivilegedCtGcDsr tests whether DSR NAT entries are removed upon a removal of
